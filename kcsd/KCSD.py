@@ -8,6 +8,7 @@ import numpy as np
 from numpy.linalg import LinAlgError, svd
 from scipy import special, integrate, interpolate
 from scipy.spatial import distance
+from tqdm import tqdm
 from . import utility_functions as utils
 from . import basis_functions as basis
 
@@ -76,9 +77,17 @@ class KCSD(CSD):
     def __init__(self, ele_pos, pots, **kwargs):
         super(KCSD, self).__init__(ele_pos, pots)
         self.parameters(**kwargs)
+        if self.verbose:
+            print('kcsd.estimate_at()')
         self.estimate_at()
+        if self.verbose:
+            print('kcsd.place_basis()')
         self.place_basis()
+        if self.verbose:
+            print('kcsd.create_src_dist_tables()')
         self.create_src_dist_tables()
+        if self.verbose:
+            print('kcsd.method()')
         self.method()
 
     def parameters(self, **kwargs):
@@ -106,6 +115,9 @@ class KCSD(CSD):
         self.xmax = kwargs.pop('xmax', np.max(self.ele_pos[:, 0]))
         self.gdx = kwargs.pop('gdx', 0.01*(self.xmax - self.xmin))
         self.dist_table_density = kwargs.pop('dist_table_density', 20)
+        self.cv_iterator = kwargs.pop('cv_iterator', None)
+        self.verbose = kwargs.pop('verbose', False)
+        self.n_lambda_suggestions = kwargs.pop('n_lambda_suggestions', 30)
         if self.dim >= 2:
             self.ext_y = kwargs.pop('ext_y', 0.0)
             self.ymin = kwargs.pop('ymin', np.min(self.ele_pos[:, 1]))
@@ -126,9 +138,17 @@ class KCSD(CSD):
         self.k_pot and self.k_interp_cross matrices
 
         """
+        if self.verbose:
+            print('kcsd.create_lookup()')
         self.create_lookup()                                # Look up table
+        if self.verbose:
+            print('kcsd.update_b_pot()')
         self.update_b_pot()                                 # update kernel
+        if self.verbose:
+            print('kcsd.update_b_src()')
         self.update_b_src()                                 # update crskernel
+        if self.verbose:
+            print('kcsd.create_lookup()')
         self.update_b_interp_pot()                          # update pot interp
 
     def create_lookup(self):
@@ -294,14 +314,17 @@ class KCSD(CSD):
 
         """
         if lambdas is None:                           # when None
-            print('No lambda given, using defaults')
-            lambdas = np.logspace(-2,-25,25,base=10.) # Default multiple lambda
+            print('cross_validate(): No lambda given, using defaults')
+            # lambdas = np.logspace(-1,-25,25,base=10.) # Default multiple lambda
+            lambdas = self.suggest_lambda()
             lambdas = np.hstack((lambdas, np.array((0.0))))
+            print(lambdas)
         elif lambdas.size == 1:                       # resize when one entry
             lambdas = lambdas.flatten()
         if Rs is None:                                # when None
             Rs = np.array((self.R)).flatten()         # Default over one R value
         self.errs = np.zeros((Rs.size, lambdas.size))
+        self.errs_per_ele = np.zeros((Rs.size, lambdas.size, self.n_ele))
         index_generator = []
         for ii in range(self.n_ele):
             idx_test = [ii]
@@ -310,10 +333,13 @@ class KCSD(CSD):
             index_generator.append((idx_train, idx_test))
         for R_idx, R in enumerate(Rs):                # Iterate over R
             self.update_R(R)
-            print('Cross validating R (all lambda) :', R)
+            print('Cross validating R = {} (all lambda) :'.format(R))
             for lambd_idx, lambd in enumerate(lambdas):  # Iterate over lambdas
-                self.errs[R_idx, lambd_idx] = self.compute_cverror(lambd,
-                                                              index_generator)
+                print('                 R = {:.3e} lambda = {:.3e}'.format(R, lambd))
+                total_error, err_per_ele = self.compute_cverror(
+                    lambd, index_generator)
+                self.errs[R_idx, lambd_idx] = total_error
+                self.errs_per_ele[R_idx, lambd_idx, :] = err_per_ele
         err_idx = np.where(self.errs == np.min(self.errs))     # Index of the least error
         cv_R = Rs[err_idx[0]][0]      # First occurance of the least error's
         cv_lambda = lambdas[err_idx[1]][0]
@@ -343,7 +369,12 @@ class KCSD(CSD):
 
         """
         err = 0
-        for idx_train, idx_test in index_generator:
+        err_per_ele = np.zeros((len(index_generator),))
+        if self.cv_iterator is not None:
+            index_iterator = tqdm(index_generator)
+        else:
+            index_iterator = iter(index_generator)
+        for idx_train, idx_test in index_iterator:
             B_train = self.k_pot[np.ix_(idx_train, idx_train)]
             V_train = self.pots[idx_train]
             V_test = self.pots[idx_test]
@@ -356,13 +387,15 @@ class KCSD(CSD):
                 for ii in range(len(idx_train)):
                     for tt in range(self.pots.shape[1]):
                         V_est[:, tt] += beta_new[ii, tt] * B_test[:, ii]
-                err += np.linalg.norm(V_est-V_test)
+                this_err = np.linalg.norm(V_est-V_test)
+                err_per_ele[idx_test] = this_err
+                err += this_err
             except LinAlgError:
                 raise LinAlgError('Encoutered Singular Matrix Error:'
                                   'try changing ele_pos slightly')
-        return err
+        return err, err_per_ele
 
-    def suggest_lambda(self):
+    def suggest_lambda(self, n_suggestions=None):
         """Computes the lambda parameter range for regularization, 
 
         Used in Cross validation and L-curve
@@ -372,10 +405,12 @@ class KCSD(CSD):
         Lambdas : list
 
         """
+        if n_suggestions is None:
+            n_suggestions = self.n_lambda_suggestions
         u, s, v = svd(self.k_pot)
         print('min lambda', 10**np.round(np.log10(s[-1]), decimals=0))
         print('max lambda', str.format('{0:.4f}', np.std(np.diag(self.k_pot))))
-        return np.logspace(np.log10(s[-1]), np.log10(np.std(np.diag(self.k_pot))), 20)
+        return np.logspace(np.log10(s[-1]), np.log10(np.std(np.diag(self.k_pot))), n_suggestions)
 
     def L_curve(self, lambdas=None, Rs=None, n_jobs=1):
         """Method defines the L-curve.
@@ -398,7 +433,7 @@ class KCSD(CSD):
 
         """
         if lambdas is None:
-            print('No lambda given, using defaults')
+            print('L_curve(): No lambda given, using defaults')
             lambdas = self.suggest_lambda()
         else:
             lambdas = lambdas.flatten()
@@ -412,8 +447,9 @@ class KCSD(CSD):
             self.update_R(R)
             self.suggest_lambda()
             print('l-curve (all lambda): ', np.round(R, decimals=3))
-            modelnormseq, residualseq = utils.parallel_search(self.k_pot, self.pots, lambdas,
-                                                              n_jobs=n_jobs)
+            modelnormseq, residualseq = utils.parallel_search(
+                self.k_pot, self.pots, lambdas,
+                n_jobs=n_jobs)
             norm_log = np.log(modelnormseq + np.finfo(np.float64).eps)
             res_log = np.log(residualseq + np.finfo(np.float64).eps)
             curveseq = res_log[0] * (norm_log - norm_log[-1]) + res_log * (norm_log[-1] - norm_log[0]) \

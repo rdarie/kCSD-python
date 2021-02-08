@@ -7,7 +7,8 @@ import matplotlib.cm as cm
 import config
 
 
-def show_csd(csd_at, csd, show_ele=None, show_kcsd=False, show_mask=None):
+def show_csd(
+        csd_at, csd, show_ele=None, show_kcsd=False, show_mask=None):
     if config.dim == 1:
         fig = plt.figure(figsize=(6, 6))
         ax = plt.subplot(111)
